@@ -1,0 +1,749 @@
+---
+title: "Project"
+author: "habiba"
+date: "11/20/2021"
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+install.packages("tidyverse")
+install.packages("scales")
+install.packages("lubridate")
+install.packages("plotly")
+install.packages("gridExtra")
+install.packages("tidytext")
+install.packages("modelr")
+install.packages("caret")
+install.packages("ROSE")
+install.packages("glmnet")
+install.packages("rpart")
+install.packages("rpart.plot")
+install.packages("randomForest")
+```
+
+#Load Required Libraries
+```{r}
+library(tidyverse)
+library(scales)
+library(lubridate)
+library(plotly)
+library(gridExtra)
+library(tidytext)
+library(modelr)
+library(caret)
+library(ROSE)
+library(glmnet)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+options(warn = -1)
+```
+
+
+```{r}
+df <- read_csv("data/US_Accidents_Dec20_updated.csv", col_types = cols(.default = col_character())) %>% 
+  type_convert()
+```
+
+```{r}
+df %>% head(5)
+```
+
+# Data pre-processing for visualization
+# a function to change plot size, from https://www.kaggle.com/getting-started/105201
+
+```{r}
+fig <- function(width, heigth){
+     options(repr.plot.width = width, repr.plot.height = heigth)
+}
+```
+
+
+#1. Drop variables with high NA proportion
+Variables with NA proportion larger than 50% cannot give enough information to our analysis.
+These are the variables to drop:
+
+```{r}
+df %>% summarise_all(~ mean(is.na(.))) %>% 
+  pivot_longer(1:47, names_to = "Variables to drop", values_to = "NA proportion") %>% 
+  filter(`NA proportion` >= 0.5)
+
+drop_na_cols <- c("End_Lat", "End_Lng", "Number", "Wind_Chill(F)", "Precipitation(in)")
+```
+
+
+#2. Drop unuseful variables
+According to our knowledge, there are some variables like "ID", "Source" and "Timezone" will not give us insights about traffic accidents or be useful in predicting severity levels, so we can drop these variables too. These variables are shown below:
+
+```{r}
+not_useful <- c("ID", "Timezone", "Airport_Code", "Weather_Timestamp", "Wind_Direction")
+
+df %>% select(all_of(not_useful)) %>% head(5)
+df_drop <- df %>% select(-all_of(drop_na_cols), -all_of(not_useful))
+```
+
+We believed "Wind Direction" would be a beneficial feature in our project at first. However, when we plot its distribution against each severity level, the result demonstrates that it has no influence on severity because the distributions are identical.
+It also contains 25 levels, which adds to the model-building portion's difficulty. As a result, we've decided to abandon it.
+
+```{r}
+fig(13, 8)
+ggplot(df, aes(Wind_Direction, ..prop.., group = Severity)) +
+  geom_bar(aes(fill = Severity), position = "dodge") +
+  scale_y_continuous(labels = percent) +
+  labs(x = "Wind Direction",
+       y = "Proportion",
+       title = "Wind direction does not have a great impact on severity") +
+  theme(axis.text.x = element_text(angle = 60, vjust = 0.6))
+```
+
+
+#Rename variables
+A variable name containing "(" or ")" is a dangerous thing, because some functions may not be able to treat the name correctly.
+
+```{r}
+df_drop <-  df_drop %>%
+  rename("Distance" = `Distance(mi)`, "Temperature" = `Temperature(F)`, "Humidity" = `Humidity(%)`, 
+         "Pressure" = `Pressure(in)`, "Visibility" = `Visibility(mi)`, "Wind_Speed" = `Wind_Speed(mph)`)
+```
+
+
+#Transform time related variables
+As we can see, time variables in the original dataset are in a format that is difficult to alter. Furthermore, if we analyze date and time as a whole, we will lose a lot of information since some patterns, such as hourly, weekly, or monthly trends, may be concealed behind this structure. As a result, the time-related variables must be transformed into numerous additional variables:
+
+* The original:
+```{r}
+df_drop %>% select(Start_Time, End_Time) %>% head(5)
+```
+```{r}
+df_time <- df_drop %>%
+  mutate(Duration = as.numeric(End_Time - Start_Time)) %>%
+  # accident duration should be positive
+  filter(!(Duration < 0)) %>%
+  separate(Start_Time, into = c("Date", "Time"), sep = " ") %>%
+  mutate("Year" = str_sub(Date, 1, 4), "Month" = str_sub(Date, 6, 7), "Day" = str_sub(Date, 9, 10), 
+         "Wday" = as.character(wday(Date)), "Hour" = str_sub(Time, 1, 2)) %>%
+  select(-c("Date", "Time", "End_Time")) %>%
+  select(TMC, Severity, Year, Month, Day, Hour, Wday, Duration, everything())
+```
+
+* After transformation:
+```{r}
+df_time %>%
+  select(Year, Month, Day, Hour, Wday, Duration) %>%
+  head(5)
+```
+
+
+#Drop weather condition NA level
+The weather condition information is missing from the "Weather Condition" variable, which has a NA level.
+
+When dealing with NA values in a categorical variable, we generally have two options:
+
+1) Treat NA as if it were a new level with no information about the other characteristics.
+
+2)Remove all entries that have the NA value for this variable.
+
+Before we make our decision, consider this: when a weather condition is missing, other weather-related factors are likely to be missing as well.
+```{r}
+df_time %>% filter(is.na(Weather_Condition)) %>% select(Temperature:Weather_Condition) %>%
+  head(10)
+```
+
+So it should be safe to remove all records containing NA weather condition level.
+```{r}
+df_weather <- df_time %>% filter(!is.na(Weather_Condition))
+```
+
+
+#Handle TMC NA Values
+The kind of accident is indicated by the TMC code, which is an important aspect of accident records. However, when we map the TMC distribution for each severity level, we see that severity level 4 has a substantial proportion of NA values.
+
+We've decided to treat NA value as a new TMC level because it appears to be a key component of severity level 4.
+
+```{r}
+df_TMC <- df_weather %>%
+  mutate(TMC = replace_na(TMC, "NA_TMC"))
+```
+
+```{r}
+fig(13, 8)
+df_weather %>% 
+  ggplot(aes(factor(TMC), ..prop..)) +
+    geom_bar(aes(group = Severity, fill = factor(Severity)), show.legend = F) +
+    facet_wrap(~ Severity, scales = "free") +
+    labs(x = "TMC",
+         y = "Proportion",
+         title = "TMC distribution in each severity level") +
+    theme(axis.text.x = element_text(angle = 60, vjust = 0.6),
+          legend.position = "top") +
+  scale_fill_brewer(palette = "Set1")
+```
+
+
+
+#Location Related Variables
+The site of the accident might be determined by a number of factors. The collection includes state, city, county, and even street address information in addition to exact coordinates, longitude, and latitude. However, not all of them are applicable to our project.
+
+We wish to uncover some countrywide or statewide trends from this dataset when undertaking exploratory data analysis. Later, additional study at the city, county, or street level may be conducted. So, for the time being, we'll ignore these variables.
+
+```{r}
+address <- c("Country", "City", "County", "Street", "Zipcode")
+df_TMC %>%
+  select(all_of(address)) %>%
+  head(5)
+```
+
+```{r}
+df_add <- df_TMC %>% select(-all_of(address))
+```
+
+
+
+#Modify Variable Type
+Some variables will not be recognized as the intended type when reading the data into R. TMC, severity, and time-related factors, for example, are better treated as categorical variables than continuous variables. In addition, logistic variables should be considered categorical.
+
+```{r}
+df_add <- df_add %>% 
+  mutate(TMC = as.character(TMC), Severity = as.character(Severity)) %>% 
+  mutate_if(is.logical, as.character)
+```
+
+
+
+#Handle NA Values in Continues Variables
+
+There are still some entries with NA values in continuous variables, but this isn't a major problem. We can substitute the mean of the related variable for these NA values. We can view the summary of all continuous variables after replacement; there are no NA values currently.
+
+```{r}
+df_mean <- df_add %>%
+  mutate_if(is.numeric, ~ replace_na(., mean(., na.rm = T)))
+
+summary(df_mean %>% select_if(is.numeric))
+```
+
+
+
+#Handle NA Values in Categorical Variables
+
+Although NA values in continuous variables are handled correctly, NA values in categorical variables are also possible.
+
+We can see that there are just a few records that need to be handled (there are 81 records altogether, and the NA values in the final four variables all originate from the same 80 records), therefore eliminating them is a safe way.
+
+```{r}
+df_mean %>% summarise_all(~sum(is.na(.))) %>% 
+  pivot_longer(everything(), names_to = "Variable", values_to = "NA_count") %>% filter(NA_count > 0)
+```
+
+```{r}
+df_final <- df_mean %>%
+  filter(!is.na(Side)) %>%
+  filter(!is.na(Sunrise_Sunset))
+```
+
+
+#Write into csv for future use
+```{r}
+write_csv(df_final, "tidy.csv")
+```
+
+
+
+######Visualization#####
+
+In this part, we'll investigate this dataset and use several visualization techniques to try to glean some insights. We can make as many plots as we like because this dataset is pretty vast and currently has 36 columns. However, not all plots appear to be fascinating or beneficial. As a result, we'll only share a few tales that pique our attention or make us feel odd.
+
+```{r}
+df <- read_csv("./tidy.csv", col_types = cols(.default = col_character())) %>% 
+    type_convert() %>%
+    mutate(TMC = factor(TMC), Severity = factor(Severity), Year = factor(Year), Wday = factor(Wday)) %>%
+    mutate_if(is.logical, factor) %>%
+    mutate_if(is.character, factor)
+```
+
+
+#Accident Counts
+This dataset provides information on traffic accidents in 49 states. We can view the accident distribution from 2016 - 2020 on a map. On the map, the top ten states with the most accidents are highlighted. These ten states will be the subject of the modeling section later on.
+```{r}
+states <- map_data("state") %>% as_tibble() %>% select(long, lat, group, region)
+states_abb <- read_csv("../input//usa-state-name-code-and-abbreviation//data.csv") %>%
+  mutate(State = tolower(State)) %>%
+  select(State, Code) %>%
+  rename("State_full" = State)
+accident_count <- df %>%
+  count(State) %>%
+  left_join(states_abb, by = c("State" = "Code"))
+```
+
+```{r}
+states <- states %>%
+  left_join(accident_count, by = c("region" = "State_full"))
+
+# top 10 states
+top_10 <- accident_count %>%
+  arrange(desc(n)) %>%
+  head(10)
+top_10 <- top_10$State %>% unlist()
+
+top_10_map <- states %>%
+  filter(State %in% top_10)
+top_10_label <- top_10_map %>%
+  group_by(region, State) %>%
+  summarise(long = mean(long), lat = mean(lat))
+
+ggplot(states, aes(long, lat, group = group)) +
+  geom_polygon(aes(fill = n), color = "#636363", size = 0.1) +
+  geom_polygon(data = top_10_map, color = "red", fill = NA, size = 0.8) +
+  scale_fill_gradient(low = "#fee5d9", high = "#de2d26",
+                      name = "Accident Count", labels = unit_format(unit = "K", scale = 1e-03)) +
+  ggrepel::geom_label_repel(mapping = aes(label = State, group = 1), data = top_10_label) +
+  theme_minimal() +
+  coord_quickmap() +
+  labs(title = "Accident distribution in the U.S.",
+       x = "Longitude",
+       y = "Latitude")
+```
+
+```{r}
+df %>% 
+  filter(State %in% top_10) %>%
+  count(State) %>%
+  ggplot(aes(reorder(State, n), n)) +
+  geom_col() +
+  geom_label(aes(label = n), nudge_y = -30000) +
+  labs(x = NULL, y = "Number of accidents",
+       title = "Top 10 States with the most accidents") +
+  scale_x_discrete(labels = rev(c("California", "Texas", "Florida", "South Carolina",
+                              "North Carolina", "New York", "Pennsylvania",
+                              "Michigan", "Illinois", "Georgia"))) +
+  scale_y_continuous(breaks = seq(0, 700000, 100000), labels = unit_format(unit = "K", scale = 1e-03)) +
+  coord_flip()
+```
+
+
+#Distance Affected by Accidents
+The dataset's "Distance" variable refers to the length of the road that was affected by the accident. The association between distance and severity levels is something we'd want to know about.
+
+```{r}
+fig(13, 8)
+df %>%
+  group_by(Severity) %>%
+  summarise(prop = mean(Distance)) %>%
+  ggplot(aes(Severity, prop, fill = !Severity %in% c(3, 4))) +
+    geom_col() +
+    labs(
+      y = "Average affected distance (mi)",
+      title = "More severe accidents tend to affect longer road distance") +
+    scale_fill_discrete(name = "Severity", labels = c("More Severe: 3 or 4", "Less Severe: 1 or 2"))
+```
+
+
+
+#Accident Count per Severity Level
+According to our understanding, assuming that traffic conditions do not significantly change from 2016 to 2020, the severity level distribution in each year should be comparable.
+
+```{r}
+fig(13, 8)
+df %>%
+  group_by(Year, Severity) %>%
+  count() %>%
+  group_by(Year) %>%
+  mutate(sum = sum(n)) %>%
+  mutate(Proportion = n / sum) %>%
+  ggplot(aes(Severity, Proportion)) +
+  geom_col(aes(fill = Year), position = "dodge") +
+  labs(x = "Severity",
+       y = "Proportion",
+       title = "Severity proportion changes by year") +
+  scale_y_continuous(labels = percent)
+```
+
+The results suggest that from 2018 to 2019, severity level 2 increased suddenly, whereas level 3 decreased suddenly, which is a little unexpected.
+
+We are still unable to provide a convincing explanation for this outcome. To get an answer, we may need to conduct more investigation, such as speaking with someone from the traffic data source. Because what if the rule that distinguishes level 2 and level 3 has changed since 2018, we have no means of knowing for sure.
+
+
+
+#Accident Account in Different Time Scales
+One interesting finding is that visualization can reveal certain patterns when we split the original time variable into numerous new variables.
+```{r}
+g_top <- df %>%
+  count(Month) %>%
+  ggplot(aes(Month, n)) +
+  geom_line(aes(group = 1)) +
+  geom_point() +
+  labs(y = "Count",
+       x = NULL,
+    title = "Pattern between accident counts and month & day of the week") +
+  scale_x_discrete(labels = c("Jan", "Feb", "Mar", "Apr", "May",
+                              "Jun", "Jul", "Aug", "Sep", "Oct",
+                              "Nov", "Dec")) +
+  scale_y_continuous(labels = unit_format(unit = "K", scale = 1e-03))
+
+g_bottom <- df %>%
+  ggplot(aes(Month, fill = Wday)) +
+  geom_bar(position = "dodge") +
+  scale_fill_manual(values = c("deepskyblue1", "coral1", "coral1","coral1","coral1","coral1", "deepskyblue1"),
+                    name = "Day of the week",
+                    labels = c("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")) +
+  theme(legend.position = "bottom") +
+  guides(fill = guide_legend(nrow = 1)) +
+  scale_x_discrete(labels = c("Jan", "Feb", "Mar", "Apr", "May",
+                              "Jun", "Jul", "Aug", "Sep", "Oct",
+                              "Nov", "Dec")) +
+  labs(y = "Count") +
+  scale_y_continuous(labels = unit_format(unit = "K", scale = 1e-03))
+
+grid.arrange(g_top, g_bottom, heights = c(1/4, 3/4))
+```
+
+The first thing we can notice from this graph is that the number of accidents increases after July and then drops abruptly in January. We can also see the weekly trend of accidents in the bottom subplot: more accidents happen on weekdays and fewer accidents happen on weekends. Also, after July, it appears that the month has a greater influence on weekday accidents than weekends', because weekday accidents appear to climb more than weekends' from August through December.
+
+The weekly trend is simple to explain: because people are busier on weekdays, more automobiles should be on the road. In terms of the monthly trend, we believe it is the outcome of the vacation season and the reopening of many schools. More study is required to provide a definitive answer.
+
+Also worth highlighting is the hourly pattern of accidents.
+
+```{r}
+fig(14, 6)
+right <- df %>%
+  ggplot(aes(Hour, color = Wday %in% c("1", "7"), group = Wday %in% c("1", "7"))) +
+  geom_freqpoly(stat = "count") +
+  scale_color_discrete(name = "Is weekdays?", labels = c("No", "Yes")) +
+  labs(y = NULL,
+       title = " ") +
+  scale_y_continuous(labels = unit_format(unit = "K", scale = 1e-03))
+
+left <- df %>%
+  ggplot(aes(Hour, fill = !Hour %in% c("07", "08", "16", "17"))) +
+    geom_bar(show.legend = F) +
+    labs(x = "Hour",
+         y = "No of Accidents",
+         title = "Hourly Distribution of Accidents") +
+  scale_y_continuous(labels = unit_format(unit = "K", scale = 1e-03))
+
+grid.arrange(left, right, widths = c(1/2, 1/2))
+```
+
+Most accidents appear to occur between the hours of 7 a.m. - 8 a.m., and 16 p.m. - 17 p.m. When we look at the hourly patterns on weekdays and weekends individually, we see that the preceding conclusion should be ascribed to the hourly pattern on weekdays because most individuals travel between 7am - 8am and 16pm -17pm on weekdays. On weekends, we can only deduce that the majority of accidents occur during the daytime.
+
+
+
+#The Impact of Weather on Accident Severity
+Weather should, by definition, have a significant influence on the severity of an accident, according to common sense. It's logical to assume that serious accidents occur more frequently during bad weather while less severe accidents occur more frequently on clear days. However, the outcome of visualization appears to contradict this viewpoint.
+
+```{r}
+fig(15, 8)
+weather <- df %>% group_by(Severity) %>% count(Weather_Condition) %>% mutate(n = n / sum(n)) %>% filter(n > 0.02)
+weather <- weather$Weather_Condition
+
+df %>%
+  filter(Weather_Condition %in% weather) %>%
+  group_by(Severity) %>%
+  count(Weather_Condition) %>%
+  mutate(n = n / sum(n)) %>%
+  ggplot(aes(reorder_within(Weather_Condition, n, Severity), n)) +
+  geom_col(aes(fill = !Weather_Condition == "Clear"), show.legend = F) +
+  facet_wrap(~ Severity, scales = "free_y") +
+  coord_flip() +
+  scale_x_reordered() +
+  scale_y_continuous(breaks = seq(0, 0.4, 0.05), labels = percent) +
+  geom_ref_line(h = 0.1, colour = "red", size = 1) +
+  geom_ref_line(h = 0.3, colour = "red", size = 1) +
+  labs(x = "Weather Condition",
+       y = "Proportion",
+       title = "Weather condition does not have a strong impact on accident severity")
+```
+
+In fact, the distribution of the most typical weather situations under each severity level looks comparable at each level. Only level 1 differs in that more level 1 incidents occur when the weather is clear. On clear days, we may also see that more serious accidents (level 3 and 4) occur often.
+
+As a result, it appears that weather conditions have little bearing on the severity of an accident. (When we assess relevant predictors to include in the model later in the modeling phase, the weather condition is in the midst of the most essential characteristics and the least important ones.)
+
+
+#Important Note!!!
+As you can see, the severity levels in this dataset are quite unbalanced. As a result, when attempting to find a pattern between severity and other factors, we often compare using "percentage" rather than "count." This is because, if we compare severity levels 2 and 3, the big "count" values of severity levels 2 and 3 will obscure the patterns of severity levels 1 and 4.
+
+
+
+
+#####Data Pre-Processing for Modeling #####
+
+
+# Narrow it to One State
+We chose California as our target state because to the vast quantity of the dataset and the restricted computational capacity available. We can apply the same modeling procedure to different states later because the methods are ubiquitous.
+
+```{r}
+df_CA <- df %>% filter(State == "CA") %>% select(-State)
+df_CA %>%
+  head(5)
+```
+
+
+#Drop Weather or TMC Levels
+There are just a few recordings for some weather conditions or TMC levels, which may cause problems when we partition the dataset. For example, some levels may present in the training dataset but not in the test dataset, and the levels will not match when we apply the model created on the training dataset to generate predictions on the test dataset.
+
+As a result, we've removed meteorological conditions with less than 20 recordings and TMC levels with fewer than ten records. Also, removing these levels from the dataset will assist minimize the final model's complexity.
+
+These are the levels we'll be lowering:
+
+```{r}
+df_CA %>% count(Weather_Condition) %>% filter(n < 20) %>% select(Weather_Condition, n)
+
+drop_weather <- df_CA %>% count(Weather_Condition) %>% filter(n < 20) %>% select(Weather_Condition)
+drop_weather <- drop_weather$Weather_Condition %>% unlist()
+df_CA <- df_CA %>% 
+  filter(!(Weather_Condition %in% drop_weather)) %>% 
+  mutate(Weather_Condition = factor(Weather_Condition))
+
+df_CA %>% count(TMC) %>% filter(n < 10)
+
+drop_TMC <- df_CA %>% count(TMC) %>% filter(n < 10) %>% select(TMC)
+drop_TMC <- drop_TMC$TMC %>% unlist()
+df_CA <- df_CA %>% filter(!TMC %in% drop_TMC) %>% mutate(TMC = factor(TMC))
+```
+
+
+
+#Group 4 Severity Levels into 2 Levels
+Because the data is highly unbalanced among severity levels, and the majority of the accidents are classed as level 2 or level 3, we've decided to split the four categories into two. Levels 1 and 2 will be labeled "Not Severe," while levels 3 and 4 will be labeled "Severe".
+
+```{r}
+ggplot(df_CA, aes(Severity, fill = !Severity %in% c(3, 4))) +
+  geom_bar() +
+  scale_y_continuous(labels = unit_format(unit = "K", scale = 1e-03)) +
+  scale_fill_discrete(name = "Severity", labels = c("Severe: 3 or 4", "Not Severe: 1 or 2")) +
+  labs(y = "Count",
+       title = "Unbalanced severity levels")
+```
+
+After Grouping:
+
+```{r}
+df_label <- df_CA %>%
+  mutate("Status" = factor(ifelse(Severity == "3" | Severity == "4", "Severe", "Not Severe"), 
+                           levels = c("Not Severe", "Severe")))
+ggplot(df_label, aes(Status, fill = !Status == "Severe")) +
+  geom_bar() +
+  scale_y_continuous(labels = unit_format(unit = "K", scale = 1e-03)) +
+  scale_fill_discrete(name = "Severity", labels = c("Severe", "Not Severe")) +
+  labs(y = "Count",
+       x = "Severity",
+       title = "More balanced severity levels")
+```
+
+Later we can use sampling to make the data balanced.
+
+
+#Near Zero-Variance Predictors
+Some variables have low variance, which implies they can't provide us adequate information because the majority of the data has the same values for them. Worse, when the dataset is split, the levels in the training and test datasets may not match.
+
+As a result, we must eliminate the following variables:
+
+```{r}
+nzv <- nearZeroVar(df_label, saveMetrics = T)
+nzv[nzv$nzv,]
+```
+
+```{r}
+nzv_cols <- rownames(nzv[nzv$nzv,])
+df_label <- df_label %>%
+  select(-all_of(nzv_cols))
+```
+
+
+
+
+#Partition
+We separated the dataset into three subsets: training (60%), validation (20%), and test (20%), following the standard data analysis methodology (20 percent ).
+
+Use the training dataset to create several models, the validation dataset to compare models, and the test dataset to display the final results.
+
+```{r}
+set.seed(1)
+df_parts <- resample_partition(df_label, c(train = 0.6, valid = 0.2, test = 0.2))
+train_set <- as_tibble(df_parts$train)
+valid_set <- as_tibble(df_parts$valid)
+test_set <- as_tibble(df_parts$test)
+```
+
+
+
+######Modeling######
+
+#Sampling
+We need to take one more step before we begin developing models. The dataset is now more balanced in severity levels after aggregating the four severity levels into two levels. However, as seen in the graph below, the data in each severity level are not comparable.
+
+Actually, this isn't a major deal, but with more balanced data, we can better train the model and assess the final accuracy (both sensitivity and specificity need to be high to gain a higher total accuracy). So, to balance the data, we'll use various sampling techniques.
+
+```{r}
+ggplot(train_set, aes(Status)) +
+  geom_bar(aes(fill = Status)) +
+  scale_y_continuous(labels = unit_format(unit = "K", scale = 1e-03)) +
+  labs(y = "Count",
+       title = "Unbalanced severity levels")
+```
+
+To balance the data, both oversampling and undersampling are used. We may also reduce the data size to a scale that is easier to manage by using sampling techniques.
+
+```{r}
+new_train <- ovun.sample(Status ~ ., 
+                         data = train_set, 
+                         method = "both", p = 0.5, N = 90000, seed = 1)$data %>% as_tibble()
+```
+
+```{r}
+ggplot(new_train, aes(Status)) +
+  geom_bar(aes(fill = Status)) +
+  scale_y_continuous(labels = unit_format(unit = "K", scale = 1e-03)) +
+  labs(y = "Count",
+       title = "Balanced severity levels")
+
+new_train <- new_train %>% select(-Severity)
+```
+
+
+
+#Logistic Regression
+Given that our response variable now has two categories, "Severe" and "Not Severe," we should use logistic regression as our baseline model.
+
+The stepwise model selection approach may be used to find the optimum logistic regression formula. Instead of using the root-mean-square as our criterion, we might utilize statistical metrics such as AIC or BIC. In general, BIC is more stringent when it comes to variables, hence the final formula based on BIC will have fewer predictors than a formula based on AIC. However, there is no definitive answer as to which is the best. As a result, we'll merely utilize the AIC value.
+
+Because certain functions take a long time to perform, interim results are saved and read to save time.
+
+The code is displayed as a comment.
+
+# model_aic <- glm(Status ~ ., data = new_train, family = "binomial")
+# model_aic <- step(model_aic)
+
+```{r}
+model_aic <- readRDS("../input//us-accident-intermediate//lr_model_aic_CA.rds")
+```
+
+These variables are dropped:
+
+```{r}
+model_aic$anova[2:nrow(model_aic$anova), c(1, 6)] %>% as_tibble() %>% mutate(Step = str_sub(Step, start = 3)) %>%
+  rename("Vaiables to drop" = Step)
+```
+
+
+The final formula based on AIC value:
+
+```{r}
+model_aic$call
+```
+
+Make prediction on the validation dataset.
+
+To increase total accuracy, we chose 0.6 as the threshold (convert probability to response variable levels).
+
+Using a confusion matrix, we can assess how well logistic regression performs:
+```{r}
+valid_set <- read_csv("data/us-accident-intermediate//lr_valid_pred_CA.csv")
+```
+
+```{r}
+valid_pred <- valid_set %>%
+  mutate(pred = ifelse(pred > 0.6, "Severe", "Not Severe"))
+
+cm <- confusionMatrix(table(valid_pred$pred, valid_pred$Status))
+tibble("Accuracy" = cm$overall[[1]], "Sensitivity" = cm$byClass[[1]],
+          "Specificity" = cm$byClass[[2]], "Positive term" = cm$positive)
+cm
+```
+
+As can be seen from the foregoing, the performance of normal logistic regression is not satisfactory. Let's have a look at a different model.
+
+
+
+#Decision Trees
+Some tree-based algorithms are capable of categorization. Furthermore, these algorithms include a feature selection procedure, so we don't have to be fussy about our variables.
+
+Next, we'll look at decision trees, which are a highly helpful algorithm with a simple principle.
+
+```{r}
+model_decision <- rpart(Status ~ ., data = new_train, method = "class", minsplit = 20, cp = 0.001)
+```
+
+We can usually observe all of the nodes by plotting the decision tree. However, in order to get greater accuracy, we must account for a large number of variables (set cp = 0.001), which makes the final tree rather intricate and difficult to depict.
+
+```{r}
+fig(16, 8)
+rpart.plot(model_decision, box.palette = "RdBu", shadow.col = "grey", )
+```
+
+After we build the tree, let's make predictions on the validation dataset.
+
+```{r}
+valid_set <- as_tibble(df_parts$valid)
+valid_pred <- valid_set %>%
+  mutate(pred = predict(model_decision, valid_set, type = "class"))
+
+cm <- confusionMatrix(table(valid_pred$pred, valid_pred$Status))
+tibble("Accuracy" = cm$overall[[1]], "Sensitivity" = cm$byClass[[1]],
+          "Specificity" = cm$byClass[[2]], "Positive term" = cm$positive)
+cm
+```
+
+
+From the result above, we can see decision tree really gives a better performance than the previous two logistic regression model. What's more, it takes much less time to train a decision tree than logistic models.
+
+So far, decision tree is the best model we have.
+
+
+
+#Random Forest
+As we know, decision trees have the obvious drawback (though not so clear here) of having a high accuracy on the training dataset but a significantly lower accuracy on the test dataset due to overfitting.
+
+And by using an unique sampling technique known as "bootstrapping," random forest can reduce the overfitting impact. A more realistic model may be created by assessing the final out-of-bag error rate.
+
+Let's try if we can improve the accuracy any more using random forest.
+
+# model_rf <- randomForest(Status ~ ., data = new_train, mtry = 6, ntree = 500)
+
+These two arguments here are important:
+1) mtry: Number of variables randomly sampled as candidates at each split.
+2) ntree: Number of trees to grow.
+
+```{r}
+valid_pred <- read_csv("data/us-accident-intermediate/rf_valid_pred_CA.csv")
+```
+
+```{r}
+cm <- confusionMatrix(table(valid_pred$pred, valid_pred$Status))
+tibble("Accuracy" = cm$overall[[1]], "Sensitivity" = cm$byClass[[1]],
+          "Specificity" = cm$byClass[[2]], "Positive term" = cm$positive)
+cm
+```
+
+
+According to the result above, random forest does improve the accuracy compared to decision tree. However, the time consumed by training and finding the best random forest model is tremendously longer than training a decent decision tree model.
+
+
+
+
+#Conclusion
+In conclusion, when considering both performance and the time required to train the model, I prefer to make predictions using a decision tree. However, if accuracy is the only consideration, I believe random forest will emerge victorious.
+
+```{r}
+
+result  <- tibble("Model" = c("Logistic Regression", "Sparse Logistic Regression", "Decision Tree", "Random Forest"),
+                 "Accuracy" = c(0.7154623, 0.7138375, 0.8525123, 0.8849106),
+                 "Sensitivity" = c(0.7352326, 0.7277552, 0.8523101, 0.870184),
+                 "Specificity" = c(0.6754223, 0.6856505, 0.852922, 0.9147357)) %>%
+pivot_longer(2:4, names_to = "type", values_to = "value")
+
+fig(15, 8)
+result %>% ggplot(aes(type, value, fill = factor(Model, levels = c("Logistic Regression", "Decision Tree", "Random Forest")))) +
+geom_col(position = "dodge") +
+scale_fill_discrete(name = "Model") +
+labs(x = "Performance",
+    y = NULL,
+    title = "Comparison of model performance")
+```
+
